@@ -1,19 +1,23 @@
 # mrmd-julia
 
-Julia runtime server for MRMD (Markdown Runtime Multi-Document).
+Julia runtime server for MRMD.
 
-Implements the MRP (MRMD Runtime Protocol) for Julia code execution, providing:
-- Code execution with streaming output
-- Completions
-- Hover information
-- Variable inspection
-- Plot/asset capture (Plots.jl, Makie.jl)
-- Session management
+One `mrmd-julia` server process = one Julia runtime namespace.
+If you need another isolated namespace, start another server process on another port.
+
+Implements MRP (MRMD Runtime Protocol) for:
+- code execution
+- SSE-compatible execution responses
+- completions
+- hover and inspection
+- variable inspection
+- plot/asset capture (Plots.jl, Makie.jl)
+- runtime reset
 
 ## Requirements
 
 - Julia 1.9 or later
-- HTTP.jl, JSON3.jl, StructTypes.jl (auto-installed)
+- HTTP.jl, JSON3.jl, StructTypes.jl
 
 ## Installation
 
@@ -24,22 +28,16 @@ julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
 ## Usage
 
-### CLI
-
 ```bash
-# Start the server
 julia --project=. bin/mrmd-julia --port 8000 --cwd /path/to/project
-
-# Or use the executable directly
+# or
 ./bin/mrmd-julia --port 8000
 ```
 
-### From Julia
+From Julia:
 
 ```julia
 using MrmdJulia
-
-# Start server
 start_server(port=8000, host="127.0.0.1", cwd=pwd())
 ```
 
@@ -50,11 +48,9 @@ All endpoints are under `/mrp/v1/`:
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/capabilities` | GET | Server capabilities |
-| `/sessions` | GET/POST | List/create sessions |
-| `/sessions/{id}` | GET/DELETE | Get/delete session |
-| `/sessions/{id}/reset` | POST | Reset session |
-| `/execute` | POST | Execute code (sync) |
-| `/execute/stream` | POST | Execute code (SSE streaming) |
+| `/reset` | POST | Reset runtime namespace |
+| `/execute` | POST | Execute code |
+| `/execute/stream` | POST | Execute code with SSE-compatible response |
 | `/interrupt` | POST | Interrupt execution |
 | `/complete` | POST | Get completions |
 | `/inspect` | POST | Get detailed info |
@@ -62,62 +58,60 @@ All endpoints are under `/mrp/v1/`:
 | `/variables` | POST | List variables |
 | `/variables/{name}` | POST | Get variable detail |
 | `/is_complete` | POST | Check if code is complete |
-| `/assets/{path}` | GET | Serve saved assets (plots) |
+| `/format` | POST | Format code |
+| `/history` | POST | Browse persistent Julia REPL history |
+| `/assets/{path}` | GET | Serve saved assets |
 
-## Features
+## Examples
 
-### Code Execution
+### Execute
 
 ```julia
-# Streaming execution with SSE
 POST /mrp/v1/execute/stream
 {
-  "code": "for i in 1:5\n  println(i)\n  sleep(0.5)\nend",
-  "session": "default"
+  "code": "for i in 1:5\n  println(i)\n  sleep(0.5)\nend"
 }
-
-# Events: start, stdout, stderr, result/error, done
 ```
 
-### Completions
+### Complete
 
 ```julia
 POST /mrp/v1/complete
 {
   "code": "prin",
-  "cursor": 4,
-  "session": "default"
+  "cursor": 4
 }
 ```
 
-### Variable Inspection
+### Variables
 
 ```julia
 POST /mrp/v1/variables
-{
-  "session": "default"
-}
+{}
 ```
 
-### Plot Capture
+### Reset
 
-When using Plots.jl or Makie.jl, plots are automatically saved as PNG assets:
+```julia
+POST /mrp/v1/reset
+{}
+```
+
+History is backed by Julia's native REPL history file (`REPL.find_hist_file()`, typically `~/.julia/logs/repl_history.jl`), so `/history` survives runtime restarts and `POST /reset`.
+
+## Plot Capture
+
+When using Plots.jl or Makie.jl, plots are automatically saved as assets:
 
 ```julia
 using Plots
 plot(1:10, rand(10))
-# Returns asset URL in result
 ```
 
-## Configuration in mrmd.md
+## Protocol
 
-```yaml
-session:
-  julia:
-    cwd: "."
-    name: "default"
-    auto_start: true
-```
+This server implements the shared MRP spec at:
+- `../spec/mrp-protocol.md`
 
 ## License
 

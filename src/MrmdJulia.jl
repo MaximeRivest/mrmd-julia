@@ -19,6 +19,7 @@ export JuliaWorker
 export execute, execute_streaming
 export complete, hover, inspect
 export get_variables, get_variable_detail
+export get_history
 export is_complete, reset!, interrupt!
 
 # Export types
@@ -26,7 +27,7 @@ export ExecuteResult, ExecuteError
 export CompletionItem, CompleteResult
 export HoverResult, InspectResult
 export Variable, VariablesResult, VariableDetail
-export SessionInfo, Capabilities, Features, Environment
+export Capabilities, Features, Environment
 export DisplayData, Asset
 
 end # module

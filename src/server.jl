@@ -1,84 +1,15 @@
 # MRP HTTP Server for Julia runtime
 #
-# Implements the MRMD Runtime Protocol (MRP) over HTTP with SSE streaming.
-#
-# The server exposes endpoints at /mrp/v1/* for:
-# - Code execution (sync and streaming)
-# - Completions, hover, and inspect
-# - Variable inspection
-# - Session management
-# - Asset serving (for plots, HTML output, etc.)
+# Implements the MRMD Runtime Protocol (MRP) over HTTP.
+# One server process = one Julia worker = one runtime namespace.
+# Start another server process for another namespace.
 #
 # Note: types.jl and worker.jl are included by MrmdJulia.jl before this file
 
 using HTTP
 using JSON3
 using Dates
-using UUIDs
 using Sockets
-
-# Global session manager
-mutable struct SessionManager
-    sessions::Dict{String, Tuple{JuliaWorker, SessionInfo}}
-    cwd::String
-    assets_dir::String
-    lock::ReentrantLock
-end
-
-function SessionManager(; cwd::String=pwd(), assets_dir::String=joinpath(cwd, ".mrmd-assets"))
-    SessionManager(
-        Dict{String, Tuple{JuliaWorker, SessionInfo}}(),
-        cwd,
-        assets_dir,
-        ReentrantLock()
-    )
-end
-
-function get_or_create_session!(manager::SessionManager, session_id::String)
-    lock(manager.lock) do
-        if haskey(manager.sessions, session_id)
-            worker, info = manager.sessions[session_id]
-            info.lastActivity = Dates.format(now(UTC), ISODateTimeFormat)
-            return worker, info
-        end
-
-        # Create new session
-        worker = JuliaWorker(cwd=manager.cwd, assets_dir=manager.assets_dir)
-        info = SessionInfo(
-            id=session_id,
-            language="julia",
-            created=Dates.format(now(UTC), ISODateTimeFormat),
-            lastActivity=Dates.format(now(UTC), ISODateTimeFormat),
-            executionCount=0,
-            variableCount=0
-        )
-        manager.sessions[session_id] = (worker, info)
-        return worker, info
-    end
-end
-
-function get_session(manager::SessionManager, session_id::String)
-    lock(manager.lock) do
-        get(manager.sessions, session_id, nothing)
-    end
-end
-
-function list_sessions(manager::SessionManager)::Vector{SessionInfo}
-    lock(manager.lock) do
-        [info for (_, info) in values(manager.sessions)]
-    end
-end
-
-function destroy_session!(manager::SessionManager, session_id::String)::Bool
-    lock(manager.lock) do
-        if haskey(manager.sessions, session_id)
-            worker, _ = pop!(manager.sessions, session_id)
-            shutdown!(worker)
-            return true
-        end
-        return false
-    end
-end
 
 """
 MRP Server for Julia.
@@ -86,17 +17,14 @@ MRP Server for Julia.
 mutable struct MRPServer
     cwd::String
     assets_dir::String
-    session_manager::SessionManager
+    worker::JuliaWorker
 end
 
 function MRPServer(; cwd::String=pwd(), assets_dir::String=joinpath(cwd, ".mrmd-assets"))
     isdir(assets_dir) || mkpath(assets_dir)
 
-    MRPServer(
-        cwd,
-        assets_dir,
-        SessionManager(cwd=cwd, assets_dir=assets_dir)
-    )
+    worker = JuliaWorker(cwd=cwd, assets_dir=assets_dir)
+    MRPServer(cwd, assets_dir, worker)
 end
 
 """
@@ -108,8 +36,6 @@ function get_capabilities(server::MRPServer)::Capabilities
         version="0.1.0",
         languages=["julia", "jl"],
         features=Features(),
-        defaultSession="default",
-        maxSessions=10,
         environment=Environment(
             cwd=server.cwd,
             executable=Base.julia_cmd().exec[1]
@@ -126,44 +52,8 @@ function handle_capabilities(server::MRPServer, req::HTTP.Request)
     return HTTP.Response(200, json_headers(), JSON3.write(caps))
 end
 
-function handle_list_sessions(server::MRPServer, req::HTTP.Request)
-    sessions = list_sessions(server.session_manager)
-    return HTTP.Response(200, json_headers(), JSON3.write(Dict("sessions" => sessions)))
-end
-
-function handle_create_session(server::MRPServer, req::HTTP.Request)
-    body = JSON3.read(String(req.body))
-    session_id = get(body, :id, string(uuid4())[1:8])
-
-    worker, info = get_or_create_session!(server.session_manager, session_id)
-    return HTTP.Response(200, json_headers(), JSON3.write(info))
-end
-
-function handle_get_session(server::MRPServer, req::HTTP.Request, session_id::String)
-    result = get_session(server.session_manager, session_id)
-    if result === nothing
-        return HTTP.Response(404, json_headers(), JSON3.write(Dict("error" => "Session not found")))
-    end
-    _, info = result
-    return HTTP.Response(200, json_headers(), JSON3.write(info))
-end
-
-function handle_delete_session(server::MRPServer, req::HTTP.Request, session_id::String)
-    if destroy_session!(server.session_manager, session_id)
-        return HTTP.Response(200, json_headers(), JSON3.write(Dict("success" => true)))
-    end
-    return HTTP.Response(404, json_headers(), JSON3.write(Dict("error" => "Session not found")))
-end
-
-function handle_reset_session(server::MRPServer, req::HTTP.Request, session_id::String)
-    result = get_session(server.session_manager, session_id)
-    if result === nothing
-        return HTTP.Response(404, json_headers(), JSON3.write(Dict("error" => "Session not found")))
-    end
-    worker, info = result
-    reset!(worker)
-    info.executionCount = 0
-    info.variableCount = 0
+function handle_reset(server::MRPServer, req::HTTP.Request)
+    reset!(server.worker)
     return HTTP.Response(200, json_headers(), JSON3.write(Dict("success" => true)))
 end
 
@@ -171,49 +61,30 @@ function handle_execute(server::MRPServer, req::HTTP.Request)
     body = JSON3.read(String(req.body))
 
     code = get(body, :code, "")
-    # Handle null session - coalesce to "default"
-    session_id = something(get(body, :session, nothing), "default")
     store_history = get(body, :storeHistory, true)
-    exec_id = get(body, :execId, string(uuid4())[1:8])
+    exec_id = get(body, :execId, string(time_ns()))
 
-    worker, info = get_or_create_session!(server.session_manager, session_id)
-
-    result = execute(worker, code; store_history=store_history, exec_id=exec_id)
-
-    info.executionCount = result.executionCount
-    info.variableCount = get_variables(worker).count
-
+    result = execute(server.worker, code; store_history=store_history, exec_id=exec_id)
     return HTTP.Response(200, json_headers(), JSON3.write(result))
 end
 
 function handle_execute_stream(server::MRPServer, req::HTTP.Request)
-    # NOTE: True SSE streaming requires HTTP.jl streaming API which has compatibility issues.
-    # For now, fall back to non-streaming execution (same as /execute endpoint).
-    # The result is still valid MRP format, just not streamed incrementally.
+    # NOTE: True incremental SSE streaming in HTTP.jl is still not wired here.
+    # For now we execute eagerly and return SSE-compatible events.
     body = JSON3.read(String(req.body))
 
     code = get(body, :code, "")
-    # Handle null session - coalesce to "default"
-    session_id = something(get(body, :session, nothing), "default")
     store_history = get(body, :storeHistory, true)
-    exec_id = get(body, :execId, string(uuid4())[1:8])
+    exec_id = get(body, :execId, string(time_ns()))
 
-    worker, info = get_or_create_session!(server.session_manager, session_id)
+    result = execute(server.worker, code; store_history=store_history, exec_id=exec_id)
 
-    result = execute(worker, code; store_history=store_history, exec_id=exec_id)
-
-    info.executionCount = result.executionCount
-    info.variableCount = get_variables(worker).count
-
-    # Return as SSE format for compatibility with streaming clients
-    # Single "result" event followed by "done"
     sse_body = IOBuffer()
     write_sse_event(sse_body, "start", Dict(
         "execId" => exec_id,
         "timestamp" => Dates.format(now(UTC), ISODateTimeFormat)
     ))
 
-    # Send stdout/stderr if present
     if !isempty(result.stdout)
         write_sse_event(sse_body, "stdout", Dict(
             "content" => result.stdout,
@@ -238,17 +109,7 @@ function handle_execute_stream(server::MRPServer, req::HTTP.Request)
 end
 
 function handle_interrupt(server::MRPServer, req::HTTP.Request)
-    body = JSON3.read(String(req.body))
-    session_id = something(get(body, :session, nothing), "default")
-
-    result = get_session(server.session_manager, session_id)
-    if result === nothing
-        return HTTP.Response(404, json_headers(), JSON3.write(Dict("interrupted" => false, "error" => "Session not found")))
-    end
-
-    worker, _ = result
-    interrupted = interrupt!(worker)
-
+    interrupted = interrupt!(server.worker)
     return HTTP.Response(200, json_headers(), JSON3.write(Dict("interrupted" => interrupted)))
 end
 
@@ -257,11 +118,8 @@ function handle_complete(server::MRPServer, req::HTTP.Request)
 
     code = get(body, :code, "")
     cursor = get(body, :cursor, length(code))
-    session_id = something(get(body, :session, nothing), "default")
 
-    worker, _ = get_or_create_session!(server.session_manager, session_id)
-
-    result = complete(worker, code, cursor)
+    result = complete(server.worker, code, cursor)
     return HTTP.Response(200, json_headers(), JSON3.write(result))
 end
 
@@ -270,12 +128,9 @@ function handle_inspect(server::MRPServer, req::HTTP.Request)
 
     code = get(body, :code, "")
     cursor = get(body, :cursor, length(code))
-    session_id = something(get(body, :session, nothing), "default")
     detail = get(body, :detail, 1)
 
-    worker, _ = get_or_create_session!(server.session_manager, session_id)
-
-    result = inspect(worker, code, cursor; detail=detail)
+    result = inspect(server.worker, code, cursor; detail=detail)
     return HTTP.Response(200, json_headers(), JSON3.write(result))
 end
 
@@ -284,44 +139,33 @@ function handle_hover(server::MRPServer, req::HTTP.Request)
 
     code = get(body, :code, "")
     cursor = get(body, :cursor, length(code))
-    session_id = something(get(body, :session, nothing), "default")
 
-    worker, _ = get_or_create_session!(server.session_manager, session_id)
-
-    result = hover(worker, code, cursor)
+    result = hover(server.worker, code, cursor)
     return HTTP.Response(200, json_headers(), JSON3.write(result))
 end
 
 function handle_variables(server::MRPServer, req::HTTP.Request)
     body = JSON3.read(String(req.body))
-    session_id = something(get(body, :session, nothing), "default")
+    filter_config = get(body, :filter, nothing)
+    name_pattern = filter_config === nothing ? nothing : get(filter_config, :namePattern, nothing)
 
-    worker, _ = get_or_create_session!(server.session_manager, session_id)
-
-    result = get_variables(worker)
+    result = get_variables(server.worker; filter_pattern=name_pattern)
     return HTTP.Response(200, json_headers(), JSON3.write(result))
 end
 
 function handle_variable_detail(server::MRPServer, req::HTTP.Request, name::String)
     body = JSON3.read(String(req.body))
-    session_id = something(get(body, :session, nothing), "default")
     path = get(body, :path, nothing)
 
-    worker, _ = get_or_create_session!(server.session_manager, session_id)
-
-    result = get_variable_detail(worker, name; path=path)
+    result = get_variable_detail(server.worker, name; path=path)
     return HTTP.Response(200, json_headers(), JSON3.write(result))
 end
 
 function handle_is_complete(server::MRPServer, req::HTTP.Request)
     body = JSON3.read(String(req.body))
-
     code = get(body, :code, "")
-    session_id = something(get(body, :session, nothing), "default")
 
-    worker, _ = get_or_create_session!(server.session_manager, session_id)
-
-    result = is_complete(worker, code)
+    result = is_complete(server.worker, code)
     return HTTP.Response(200, json_headers(), JSON3.write(result))
 end
 
@@ -329,12 +173,21 @@ function handle_format(server::MRPServer, req::HTTP.Request)
     body = JSON3.read(String(req.body))
     code = get(body, :code, "")
 
-    # TODO: Integrate JuliaFormatter
     return HTTP.Response(200, json_headers(), JSON3.write(Dict(
         "formatted" => code,
         "changed" => false,
         "error" => "Formatting not yet implemented"
     )))
+end
+
+function handle_history(server::MRPServer, req::HTTP.Request)
+    body = JSON3.read(String(req.body))
+    n = Int(get(body, :n, 20))
+    pattern = get(body, :pattern, nothing)
+    before = haskey(body, :before) && !isnothing(get(body, :before, nothing)) ? Int(get(body, :before, 0)) : nothing
+
+    result = get_history(server.worker; n=n, pattern=pattern, before=before)
+    return HTTP.Response(200, json_headers(), JSON3.write(result))
 end
 
 function handle_assets(server::MRPServer, req::HTTP.Request, asset_path::String)
@@ -344,7 +197,6 @@ function handle_assets(server::MRPServer, req::HTTP.Request, asset_path::String)
         return HTTP.Response(404, json_headers(), JSON3.write(Dict("error" => "Asset not found")))
     end
 
-    # Determine content type
     ext = lowercase(splitext(full_path)[2])
     content_type = get(Dict(
         ".png" => "image/png",
@@ -398,7 +250,6 @@ end
 
 function create_router(server::MRPServer)
     function router(req::HTTP.Request)
-        # Handle CORS preflight
         if req.method == "OPTIONS"
             return HTTP.Response(200, [
                 "Access-Control-Allow-Origin" => "*",
@@ -412,25 +263,10 @@ function create_router(server::MRPServer)
         method = req.method
 
         try
-            # Route matching
             if path == "/mrp/v1/capabilities" && method == "GET"
                 return handle_capabilities(server, req)
-            elseif path == "/mrp/v1/sessions" && method == "GET"
-                return handle_list_sessions(server, req)
-            elseif path == "/mrp/v1/sessions" && method == "POST"
-                return handle_create_session(server, req)
-            elseif startswith(path, "/mrp/v1/sessions/") && method == "GET"
-                session_id = split(path, "/")[5]
-                if !occursin("/", session_id)
-                    return handle_get_session(server, req, session_id)
-                end
-            elseif startswith(path, "/mrp/v1/sessions/") && method == "DELETE"
-                session_id = split(path, "/")[5]
-                return handle_delete_session(server, req, session_id)
-            elseif startswith(path, "/mrp/v1/sessions/") && endswith(path, "/reset") && method == "POST"
-                parts = split(path, "/")
-                session_id = parts[5]
-                return handle_reset_session(server, req, session_id)
+            elseif path == "/mrp/v1/reset" && method == "POST"
+                return handle_reset(server, req)
             elseif path == "/mrp/v1/execute" && method == "POST"
                 return handle_execute(server, req)
             elseif path == "/mrp/v1/execute/stream" && method == "POST"
@@ -452,14 +288,14 @@ function create_router(server::MRPServer)
                 return handle_is_complete(server, req)
             elseif path == "/mrp/v1/format" && method == "POST"
                 return handle_format(server, req)
+            elseif path == "/mrp/v1/history" && method == "POST"
+                return handle_history(server, req)
             elseif startswith(path, "/mrp/v1/assets/") && method == "GET"
                 asset_path = join(split(path, "/")[5:end], "/")
                 return handle_assets(server, req, asset_path)
             end
 
-            # 404 for unknown routes
             return HTTP.Response(404, json_headers(), JSON3.write(Dict("error" => "Not found")))
-
         catch e
             @error "Request error" exception=(e, catch_backtrace())
             return HTTP.Response(500, json_headers(), JSON3.write(Dict(
@@ -495,10 +331,7 @@ function start_server(;
     router = create_router(server)
 
     @info "Starting mrmd-julia MRP server" host=host port=port cwd=cwd
-
-    # Start HTTP server
     HTTP.serve(router, host, port)
 end
 
-# Export main function
 export start_server

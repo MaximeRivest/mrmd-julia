@@ -14,6 +14,7 @@ Supports streaming output, completions, hover, and variable inspection.
 mutable struct JuliaWorker
     cwd::String
     assets_dir::String
+    history_file::String
     execution_count::Int
     created::DateTime
     last_activity::DateTime
@@ -39,9 +40,15 @@ function JuliaWorker(; cwd::String=pwd(), assets_dir::String=joinpath(cwd, ".mrm
     # Make sure assets directory exists
     isdir(assets_dir) || mkpath(assets_dir)
 
+    history_file = REPL.find_hist_file()
+    history_dir = dirname(history_file)
+    isdir(history_dir) || mkpath(history_dir)
+    isfile(history_file) || touch(history_file)
+
     JuliaWorker(
         cwd,
         assets_dir,
+        history_file,
         0,
         now(UTC),
         now(UTC),
@@ -81,6 +88,7 @@ function execute_streaming(worker::JuliaWorker, code::String;
 
         if store_history
             worker.execution_count += 1
+            append_history_entry!(worker, code)
         end
 
         start_time = time()
@@ -854,7 +862,33 @@ function is_complete(worker::JuliaWorker, code::String)::IsCompleteResult
 end
 
 """
-Reset the session (clear all variables).
+Get persistent Julia REPL history.
+"""
+function get_history(worker::JuliaWorker; n::Int=20, pattern::Union{String, Nothing}=nothing, before::Union{Int, Nothing}=nothing)::HistoryResult
+    lock(worker.lock) do
+        n <= 0 && (n = 20)
+
+        entries = load_history_entries(worker.history_file)
+        if pattern !== nothing && !isempty(pattern)
+            rx = glob_to_regex(pattern)
+            entries = filter(entry -> occursin(rx, entry.code), entries)
+        end
+        if before !== nothing
+            entries = filter(entry -> entry.historyIndex < before, entries)
+        end
+
+        total = length(entries)
+        if total == 0
+            return HistoryResult(entries=HistoryEntry[], hasMore=false)
+        end
+
+        start_idx = max(1, total - n + 1)
+        return HistoryResult(entries=entries[start_idx:end], hasMore=start_idx > 1)
+    end
+end
+
+"""
+Reset the runtime namespace (clear all variables).
 """
 function reset!(worker::JuliaWorker)
     lock(worker.lock) do
@@ -878,11 +912,77 @@ function get_info(worker::JuliaWorker)::Dict{String, Any}
     Dict{String, Any}(
         "cwd" => worker.cwd,
         "assets_dir" => worker.assets_dir,
+        "history_file" => worker.history_file,
         "execution_count" => worker.execution_count,
         "created" => Dates.format(worker.created, ISODateTimeFormat),
         "last_activity" => Dates.format(worker.last_activity, ISODateTimeFormat),
         "julia_version" => string(VERSION)
     )
+end
+
+function append_history_entry!(worker::JuliaWorker, code::String)
+    isempty(strip(code)) && return nothing
+
+    open(worker.history_file, "a") do io
+        timestamp = string(Dates.format(now(), "yyyy-mm-dd HH:MM:SS"), " UTC")
+        write(io, "# time: ", timestamp, "\n")
+        write(io, "# mode: julia\n")
+        for line in split(replace(code, "\r\n" => "\n", "\r" => "\n"), "\n"; keepempty=true)
+            write(io, "\t", line, "\n")
+        end
+    end
+
+    nothing
+end
+
+function load_history_entries(path::String)::Vector{HistoryEntry}
+    isfile(path) || return HistoryEntry[]
+
+    lines = readlines(path)
+    entries = HistoryEntry[]
+    i = 1
+    history_index = 1
+
+    while i <= length(lines)
+        if startswith(lines[i], "# time: ")
+            i += 1
+            mode = "julia"
+            if i <= length(lines) && startswith(lines[i], "# mode: ")
+                mode = strip(lines[i][9:end])
+                i += 1
+            end
+
+            code_lines = String[]
+            while i <= length(lines) && !startswith(lines[i], "# time: ")
+                line = lines[i]
+                if startswith(line, '\t')
+                    push!(code_lines, line[2:end])
+                elseif isempty(strip(line))
+                    push!(code_lines, "")
+                end
+                i += 1
+            end
+
+            if mode == "julia"
+                push!(entries, HistoryEntry(
+                    historyIndex=history_index,
+                    code=join(code_lines, "\n")
+                ))
+                history_index += 1
+            end
+            continue
+        end
+
+        i += 1
+    end
+
+    entries
+end
+
+function glob_to_regex(pattern::String)::Regex
+    escaped = replace(pattern, r"([.^$+(){}\[\]|\\])" => s"\\\1")
+    escaped = replace(escaped, "*" => ".*", "?" => ".")
+    Regex("^" * escaped * "\$", "s")
 end
 
 # Helper functions
