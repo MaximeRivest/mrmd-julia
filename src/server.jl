@@ -64,7 +64,9 @@ function handle_execute(server::MRPServer, req::HTTP.Request)
     store_history = get(body, :storeHistory, true)
     exec_id = get(body, :execId, string(time_ns()))
 
-    result = execute(server.worker, code; store_history=store_history, exec_id=exec_id)
+    # Run evaluation in its own task so the HTTP server can continue
+    # servicing requests like /interrupt while code is executing.
+    result = fetch(@async execute(server.worker, code; store_history=store_history, exec_id=exec_id))
     return HTTP.Response(200, json_headers(), JSON3.write(result))
 end
 
@@ -77,7 +79,9 @@ function handle_execute_stream(server::MRPServer, req::HTTP.Request)
     store_history = get(body, :storeHistory, true)
     exec_id = get(body, :execId, string(time_ns()))
 
-    result = execute(server.worker, code; store_history=store_history, exec_id=exec_id)
+    # Run evaluation in its own task so /interrupt can be serviced while
+    # this request is waiting on the result.
+    result = fetch(@async execute(server.worker, code; store_history=store_history, exec_id=exec_id))
 
     sse_body = IOBuffer()
     write_sse_event(sse_body, "start", Dict(

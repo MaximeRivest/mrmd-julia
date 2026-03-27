@@ -22,8 +22,11 @@ mutable struct JuliaWorker
     # Execution module - variables persist here
     mod::Module
 
-    # Interrupt flag
+    # Interrupt state
     interrupted::Bool
+    current_task::Union{Task, Nothing}
+    current_exec_id::Union{String, Nothing}
+    interrupt_lock::ReentrantLock
 
     # Pending input
     pending_input::Union{Channel{String}, Nothing}
@@ -55,6 +58,9 @@ function JuliaWorker(; cwd::String=pwd(), assets_dir::String=joinpath(cwd, ".mrm
         mod,
         false,
         nothing,
+        nothing,
+        ReentrantLock(),
+        nothing,
         false,
         ReentrantLock()
     )
@@ -85,6 +91,11 @@ function execute_streaming(worker::JuliaWorker, code::String;
         worker.interrupted = false
         worker.input_cancelled = false
         worker.last_activity = now(UTC)
+
+        lock(worker.interrupt_lock) do
+            worker.current_task = current_task()
+            worker.current_exec_id = exec_id
+        end
 
         if store_history
             worker.execution_count += 1
@@ -232,6 +243,11 @@ function execute_streaming(worker::JuliaWorker, code::String;
             stdout_str = accumulated_stdout
             stderr_str = accumulated_stderr
 
+            lock(worker.interrupt_lock) do
+                worker.current_task = nothing
+                worker.current_exec_id = nothing
+            end
+
             return ExecuteResult(
                 success=true,
                 stdout=stdout_str,
@@ -271,6 +287,11 @@ function execute_streaming(worker::JuliaWorker, code::String;
 
             stdout_str = on_output !== nothing ? accumulated_stdout : String(take!(stdout_buf))
             stderr_str = on_output !== nothing ? accumulated_stderr : String(take!(stderr_buf))
+
+            lock(worker.interrupt_lock) do
+                worker.current_task = nothing
+                worker.current_exec_id = nothing
+            end
 
             return ExecuteResult(
                 success=false,
@@ -442,11 +463,31 @@ end
 
 """
 Interrupt the current execution.
+
+Best-effort strategy:
+1. Mark the worker interrupted (checked between top-level expressions)
+2. If there is an active execution task, inject InterruptException() into it
+
+This makes `/interrupt` actually preempt long-running work such as `sleep()` or
+other yield points, instead of only setting a flag.
 """
 function interrupt!(worker::JuliaWorker)::Bool
     worker.interrupted = true
-    # TODO: Actually interrupt running task if possible
-    return true
+
+    task = lock(worker.interrupt_lock) do
+        worker.current_task
+    end
+
+    if task === nothing || istaskdone(task)
+        return false
+    end
+
+    try
+        schedule(task, InterruptException(); error=true)
+        return true
+    catch
+        return false
+    end
 end
 
 """
